@@ -689,48 +689,115 @@ class CatalogBuilder implements CatalogBuilderInterface
     private function buildZones(SimpleXMLElement $root, array $deviceGroups): array
     {
         $zones = [];
+        $zonesProcessed = 0;
+        $zonesFailed = 0;
 
-        // For v1 implementation, create a simplified global union of all zones
-        // In a full implementation, this would track zone availability per device group
-        
-        // Collect zones from shared configuration
-        $sharedConfig = $root->xpath('//shared')[0] ?? null;
-        if ($sharedConfig) {
-            $sharedZones = $sharedConfig->xpath('.//zone/entry');
-            foreach ($sharedZones as $zone) {
-                $zoneName = (string) $zone['name'];
-                if (!empty($zoneName)) {
-                    $zones[$zoneName] = ['scope' => 'Shared', 'deviceGroups' => []];
-                }
-            }
-        }
-
-        // Collect zones from each device group
-        foreach ($deviceGroups as $dgName => $dgInfo) {
-            // Try direct format first
-            $dgElements = $root->xpath("//device-group[@name='{$dgName}']");
-            
-            // If not found, try nested format
-            if (empty($dgElements)) {
-                $dgElements = $root->xpath("//devices/entry/device-group/entry[@name='{$dgName}']");
-            }
-            
-            if (!empty($dgElements)) {
-                $dgZones = $dgElements[0]->xpath('.//zone/entry');
-                foreach ($dgZones as $zone) {
-                    $zoneName = (string) $zone['name'];
-                    if (!empty($zoneName)) {
-                        if (!isset($zones[$zoneName])) {
-                            $zones[$zoneName] = ['scope' => $dgName, 'deviceGroups' => [$dgName]];
-                        } else {
-                            // Zone exists in multiple scopes, add this device group
-                            if (!in_array($dgName, $zones[$zoneName]['deviceGroups'])) {
-                                $zones[$zoneName]['deviceGroups'][] = $dgName;
-                            }
+        try {
+            // Collect zones from shared configuration
+            $sharedConfig = $root->xpath('//shared')[0] ?? null;
+            if ($sharedConfig) {
+                $sharedZones = $sharedConfig->xpath('.//zone/entry');
+                foreach ($sharedZones as $zone) {
+                    try {
+                        $zoneName = (string) $zone['name'];
+                        if (!empty($zoneName)) {
+                            $zones[$zoneName] = ['scope' => 'Shared', 'deviceGroups' => []];
+                            $zonesProcessed++;
                         }
+                    } catch (\Exception $e) {
+                        $zonesFailed++;
+                        $this->logger->warning('Failed to process shared zone', [
+                            'error' => $e->getMessage()
+                        ]);
                     }
                 }
             }
+
+            // Collect zones from device groups (try multiple patterns)
+            foreach ($deviceGroups as $dgName => $dgInfo) {
+                try {
+                    // Try direct format first
+                    $dgElements = $root->xpath("//device-group[@name='{$dgName}']");
+                    
+                    // If not found, try nested format
+                    if (empty($dgElements)) {
+                        $dgElements = $root->xpath("//devices/entry/device-group/entry[@name='{$dgName}']");
+                    }
+                    
+                    if (!empty($dgElements)) {
+                        $dgZones = $dgElements[0]->xpath('.//zone/entry');
+                        foreach ($dgZones as $zone) {
+                            try {
+                                $zoneName = (string) $zone['name'];
+                                if (!empty($zoneName)) {
+                                    if (!isset($zones[$zoneName])) {
+                                        $zones[$zoneName] = ['scope' => $dgName, 'deviceGroups' => [$dgName]];
+                                    } else {
+                                        // Zone exists in multiple scopes, add this device group
+                                        if (!in_array($dgName, $zones[$zoneName]['deviceGroups'])) {
+                                            $zones[$zoneName]['deviceGroups'][] = $dgName;
+                                        }
+                                    }
+                                    $zonesProcessed++;
+                                }
+                            } catch (\Exception $e) {
+                                $zonesFailed++;
+                                $this->logger->warning('Failed to process device group zone', [
+                                    'device_group' => $dgName,
+                                    'error' => $e->getMessage()
+                                ]);
+                            }
+                        }
+                    }
+                } catch (\Exception $e) {
+                    $this->logger->warning('Failed to process zones for device group', [
+                        'device_group' => $dgName,
+                        'error' => $e->getMessage()
+                    ]);
+                }
+            }
+
+            // If we didn't find many zones, try the global zone pattern (based on diagnostic)
+            if (count($zones) < 100) { // Arbitrary threshold - you have 6522 zones
+                $this->logger->debug('Trying global zone pattern due to low zone count', [
+                    'current_count' => count($zones)
+                ]);
+                
+                try {
+                    // Try the pattern that worked in diagnostic: //devices//zone/entry
+                    $globalZones = $root->xpath('//devices//zone/entry');
+                    foreach ($globalZones as $zone) {
+                        try {
+                            $zoneName = (string) $zone['name'];
+                            if (!empty($zoneName) && !isset($zones[$zoneName])) {
+                                $zones[$zoneName] = ['scope' => 'Global', 'deviceGroups' => []];
+                                $zonesProcessed++;
+                            }
+                        } catch (\Exception $e) {
+                            $zonesFailed++;
+                            $this->logger->warning('Failed to process global zone', [
+                                'error' => $e->getMessage()
+                            ]);
+                        }
+                    }
+                } catch (\Exception $e) {
+                    $this->logger->warning('Failed to process global zones', [
+                        'error' => $e->getMessage()
+                    ]);
+                }
+            }
+
+            $this->logger->info('Zones catalog building completed', [
+                'zones_processed' => $zonesProcessed,
+                'zones_failed' => $zonesFailed,
+                'total_zones' => count($zones)
+            ]);
+
+        } catch (\Exception $e) {
+            $this->logger->error('Critical error building zones catalog', [
+                'error' => $e->getMessage(),
+                'zones_processed' => $zonesProcessed
+            ]);
         }
 
         return $zones;
