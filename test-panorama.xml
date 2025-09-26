@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+    <shared>
+        <address>
+            <entry name="test-address">
+                <ip-netmask>192.168.1.1/32</ip-netmask>
+            </entry>
+        </address>
+    </shared>
+    <device-group name="test-dg">
+        <rulebase>
+            <security>
+                <rules>
+                    <entry name="test-rule">
+                        <from><member>any</member></from>
+                        <to><member>any</member></to>
+                        <source><member>any</member></source>
+                        <destination><member>any</member></destination>
+                        <application><member>any</member></application>
+                        <service><member>any</member></service>
+                        <action>allow</action>
+                    </entry>
+                </rules>
+            </security>
+        </rulebase>
+    </device-group>
+</config>
