@@ -11,6 +11,8 @@ use App\Services\Panorama\Exceptions\XmlParsingException;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use MongoDB\Client as MongoClient;
+use MongoDB\Exception\Exception as MongoException;
 
 class ImportPanorama extends Command
 {
@@ -21,12 +23,15 @@ class ImportPanorama extends Command
         {--file= : Path to Panorama XML export file}
         {--tenant= : Logical tenant name (default: default)}
         {--date= : Snapshot date in YYYY-MM-DD format (default: today)}
-        {--out= : NDJSON output file path (default: storage/app/panorama_rules.ndjson)}';
+        {--out= : NDJSON output file path (default: storage/app/panorama_rules.ndjson)}
+        {--mongodb= : MongoDB connection string (optional)}
+        {--db= : MongoDB database name (default: firewall)}
+        {--collection= : MongoDB collection name (default: rules)}';
 
     /**
      * The console command description.
      */
-    protected $description = 'Import Panorama XML configuration and generate NDJSON for Elasticsearch';
+    protected $description = 'Import Panorama XML configuration and generate NDJSON output with optional MongoDB upsert';
 
     /**
      * Execute the console command.
@@ -99,12 +104,25 @@ class ImportPanorama extends Command
             $this->info("Processing time: {$processingTime} seconds");
             $this->info("Output written to: {$parameters['output']}");
             
+            // MongoDB upsert if connection provided
+            if ($parameters['mongodb']) {
+                $this->info("Starting MongoDB upsert...");
+                $upsertedCount = $this->upsertToMongoDB(
+                    $parameters['output'],
+                    $parameters['mongodb'],
+                    $parameters['db'],
+                    $parameters['collection']
+                );
+                $this->info("✓ MongoDB upsert complete: {$upsertedCount} documents");
+            }
+            
             Log::info('Panorama rules ingestion completed successfully', [
                 'rules_processed' => $rulesProcessed,
                 'processing_time_seconds' => $processingTime,
                 'device_groups' => $deviceGroupCount,
                 'objects' => $objectCount,
-                'zones' => $zoneCount
+                'zones' => $zoneCount,
+                'mongodb_upserted' => $parameters['mongodb'] ? $upsertedCount ?? 0 : null
             ]);
             
             return Command::SUCCESS;
@@ -195,11 +213,19 @@ class ImportPanorama extends Command
             throw new \InvalidArgumentException("Output directory is not writable: {$outputDir}");
         }
         
+        // Get MongoDB parameters
+        $mongodb = $this->option('mongodb');
+        $db = $this->option('db') ?: 'firewall';
+        $collection = $this->option('collection') ?: 'rules';
+        
         return [
             'file' => $file,
             'tenant' => $tenant,
             'date' => $date,
-            'output' => $output
+            'output' => $output,
+            'mongodb' => $mongodb,
+            'db' => $db,
+            'collection' => $collection
         ];
     }
 
@@ -240,5 +266,145 @@ class ImportPanorama extends Command
         }
         
         return $stream;
+    }
+
+    /**
+     * Upsert NDJSON data to MongoDB
+     *
+     * @param string $ndjsonPath Path to NDJSON file
+     * @param string $connectionString MongoDB connection string
+     * @param string $database Database name
+     * @param string $collection Collection name
+     * @return int Number of documents upserted
+     */
+    private function upsertToMongoDB(string $ndjsonPath, string $connectionString, string $database, string $collection): int
+    {
+        try {
+            // Connect to MongoDB
+            $client = new MongoClient($connectionString);
+            $db = $client->selectDatabase($database);
+            $coll = $db->selectCollection($collection);
+            
+            $this->info("Connected to MongoDB: {$database}.{$collection}");
+            
+            // Create indexes for optimal upsert performance
+            $this->createMongoDBIndexes($coll);
+            
+            // Read and process NDJSON file
+            $handle = fopen($ndjsonPath, 'r');
+            if ($handle === false) {
+                throw new \RuntimeException("Cannot open NDJSON file: {$ndjsonPath}");
+            }
+            
+            $upsertedCount = 0;
+            $batchSize = 1000;
+            $batch = [];
+            
+            $this->info("Processing NDJSON file for MongoDB upsert...");
+            
+            while (($line = fgets($handle)) !== false) {
+                $line = trim($line);
+                if (empty($line)) {
+                    continue;
+                }
+                
+                try {
+                    $document = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+                    
+                    // Prepare upsert operation
+                    $batch[] = [
+                        'replaceOne' => [
+                            [
+                                'rule_uid' => $document['rule_uid'],
+                                'panorama_tenant' => $document['panorama_tenant']
+                            ],
+                            $document,
+                            ['upsert' => true]
+                        ]
+                    ];
+                    
+                    // Execute batch when it reaches the batch size
+                    if (count($batch) >= $batchSize) {
+                        $result = $coll->bulkWrite($batch);
+                        $upsertedCount += $result->getUpsertedCount() + $result->getModifiedCount();
+                        $batch = [];
+                        
+                        $this->info("Processed {$upsertedCount} documents...");
+                    }
+                    
+                } catch (\JsonException $e) {
+                    Log::warning('Failed to parse JSON line', [
+                        'line' => substr($line, 0, 100),
+                        'error' => $e->getMessage()
+                    ]);
+                    continue;
+                }
+            }
+            
+            // Process remaining batch
+            if (!empty($batch)) {
+                $result = $coll->bulkWrite($batch);
+                $upsertedCount += $result->getUpsertedCount() + $result->getModifiedCount();
+            }
+            
+            fclose($handle);
+            
+            return $upsertedCount;
+            
+        } catch (MongoException $e) {
+            Log::error('MongoDB operation failed', [
+                'error' => $e->getMessage(),
+                'connection' => $connectionString
+            ]);
+            throw new \RuntimeException("MongoDB operation failed: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Create MongoDB indexes for optimal performance
+     *
+     * @param \MongoDB\Collection $collection MongoDB collection
+     */
+    private function createMongoDBIndexes($collection): void
+    {
+        $this->info("Creating MongoDB indexes...");
+        
+        try {
+            // Unique index for upserts
+            $collection->createIndex(
+                ['rule_uid' => 1, 'panorama_tenant' => 1],
+                ['unique' => true, 'name' => 'rule_uid_tenant_unique']
+            );
+            
+            // Performance indexes for common queries
+            $collection->createIndex(
+                ['panorama_tenant' => 1, 'snapshot_date' => -1],
+                ['name' => 'tenant_date_idx']
+            );
+            
+            $collection->createIndex(
+                ['device_group' => 1],
+                ['name' => 'device_group_idx']
+            );
+            
+            $collection->createIndex(
+                ['action' => 1, 'disabled' => 1],
+                ['name' => 'action_disabled_idx']
+            );
+            
+            $collection->createIndex(
+                ['snapshot_date' => -1],
+                ['name' => 'snapshot_date_idx']
+            );
+            
+            $this->info("✓ MongoDB indexes created successfully");
+            
+        } catch (MongoException $e) {
+            // Log warning but don't fail - indexes might already exist
+            Log::warning('Failed to create some MongoDB indexes', [
+                'error' => $e->getMessage()
+            ]);
+            $this->warn("Warning: Some indexes may not have been created");
+        }
     }
 }
