@@ -35,8 +35,29 @@ class RuleEmitter implements RuleEmitterInterface
         ]);
         
         try {
-            // Process device groups and their security rules
+            // Process device groups and their security rules - try both formats
             $deviceGroups = $root->xpath('//device-group');
+            
+            // If no direct device-group elements, try nested format
+            if (empty($deviceGroups)) {
+                $deviceGroups = $root->xpath('//devices/entry/device-group/entry');
+                $this->logger->debug('Using nested device group format for rule processing');
+            } else {
+                // Check if these are container elements (no name attribute)
+                $hasNamedElements = false;
+                foreach ($deviceGroups as $dg) {
+                    if (isset($dg['name'])) {
+                        $hasNamedElements = true;
+                        break;
+                    }
+                }
+                
+                // If no named elements, use the nested format
+                if (!$hasNamedElements) {
+                    $deviceGroups = $root->xpath('//devices/entry/device-group/entry');
+                    $this->logger->debug('Using nested device group format for rule processing (container elements found)');
+                }
+            }
             
             if (empty($deviceGroups)) {
                 $this->logger->warning('No device groups found for rule processing');

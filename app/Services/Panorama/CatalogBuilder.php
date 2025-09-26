@@ -79,8 +79,29 @@ class CatalogBuilder implements CatalogBuilderInterface
         $malformedCount = 0;
         
         try {
-            // Find device groups in the XML structure
+            // Find device groups in the XML structure - try both formats
             $dgElements = $root->xpath('//device-group');
+            
+            // If no direct device-group elements, try nested format
+            if (empty($dgElements)) {
+                $dgElements = $root->xpath('//devices/entry/device-group/entry');
+                $this->logger->debug('Using nested device group format');
+            } else {
+                // Check if these are container elements (no name attribute)
+                $hasNamedElements = false;
+                foreach ($dgElements as $dg) {
+                    if (isset($dg['name'])) {
+                        $hasNamedElements = true;
+                        break;
+                    }
+                }
+                
+                // If no named elements, use the nested format
+                if (!$hasNamedElements) {
+                    $dgElements = $root->xpath('//devices/entry/device-group/entry');
+                    $this->logger->debug('Using nested device group format (container elements found)');
+                }
+            }
             
             if (empty($dgElements)) {
                 $this->logger->warning('No device groups found in XML configuration');
@@ -308,7 +329,14 @@ class CatalogBuilder implements CatalogBuilderInterface
             // Build objects for each device group
             foreach ($deviceGroups as $dgName => $dgInfo) {
                 try {
+                    // Try direct format first
                     $dgElements = $root->xpath("//device-group[@name='{$dgName}']");
+                    
+                    // If not found, try nested format
+                    if (empty($dgElements)) {
+                        $dgElements = $root->xpath("//devices/entry/device-group/entry[@name='{$dgName}']");
+                    }
+                    
                     if (!empty($dgElements)) {
                         $this->logger->debug('Building objects for device group', ['device_group' => $dgName]);
                         $objects[$dgName] = $this->buildObjectsForScope($dgElements[0], $dgName);
@@ -679,7 +707,14 @@ class CatalogBuilder implements CatalogBuilderInterface
 
         // Collect zones from each device group
         foreach ($deviceGroups as $dgName => $dgInfo) {
+            // Try direct format first
             $dgElements = $root->xpath("//device-group[@name='{$dgName}']");
+            
+            // If not found, try nested format
+            if (empty($dgElements)) {
+                $dgElements = $root->xpath("//devices/entry/device-group/entry[@name='{$dgName}']");
+            }
+            
             if (!empty($dgElements)) {
                 $dgZones = $dgElements[0]->xpath('.//zone/entry');
                 foreach ($dgZones as $zone) {
