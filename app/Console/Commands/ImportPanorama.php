@@ -26,7 +26,8 @@ class ImportPanorama extends Command
         {--out= : NDJSON output file path (default: storage/app/panorama_rules.ndjson)}
         {--mongodb= : MongoDB connection string (optional)}
         {--db= : MongoDB database name (default: firewall)}
-        {--collection= : MongoDB collection name (default: rules)}';
+        {--collection= : MongoDB collection name (default: rules)}
+        {--skip-xml : Skip XML processing and use existing NDJSON file for MongoDB upsert}';
 
     /**
      * The console command description.
@@ -43,6 +44,11 @@ class ImportPanorama extends Command
         try {
             // Get and validate parameters
             $parameters = $this->getValidatedParameters();
+            
+            // Check if we should skip XML processing
+            if ($parameters['skip_xml']) {
+                return $this->handleSkipXmlMode($parameters, $startTime);
+            }
             
             Log::info('Starting Panorama rules ingestion', [
                 'file' => $parameters['file'],
@@ -217,6 +223,7 @@ class ImportPanorama extends Command
         $mongodb = $this->option('mongodb');
         $db = $this->option('db') ?: 'firewall';
         $collection = $this->option('collection') ?: 'rules';
+        $skipXml = $this->option('skip-xml');
         
         return [
             'file' => $file,
@@ -225,7 +232,8 @@ class ImportPanorama extends Command
             'output' => $output,
             'mongodb' => $mongodb,
             'db' => $db,
-            'collection' => $collection
+            'collection' => $collection,
+            'skip_xml' => $skipXml
         ];
     }
 
@@ -406,5 +414,101 @@ class ImportPanorama extends Command
             ]);
             $this->warn("Warning: Some indexes may not have been created");
         }
+    }
+
+    /**
+     * Handle skip-xml mode - use existing NDJSON file for MongoDB upsert only
+     *
+     * @param array $parameters Command parameters
+     * @param float $startTime Start time for timing
+     * @return int Command exit code
+     */
+    private function handleSkipXmlMode(array $parameters, float $startTime): int
+    {
+        $this->info("Skip XML mode: Using existing NDJSON file for MongoDB upsert");
+        $this->info("NDJSON file: {$parameters['output']}");
+        
+        // Validate that the NDJSON file exists
+        if (!file_exists($parameters['output'])) {
+            $this->line("NDJSON file does not exist: {$parameters['output']}");
+            $this->line("Run without --skip-xml to generate the file first.");
+            return Command::FAILURE;
+        }
+        
+        // Validate that MongoDB connection is provided
+        if (!$parameters['mongodb']) {
+            $this->line("MongoDB connection string is required when using --skip-xml");
+            $this->line("Use --mongodb option to specify connection string.");
+            return Command::FAILURE;
+        }
+        
+        // Get file info
+        $fileSize = filesize($parameters['output']);
+        $lineCount = $this->countNdjsonLines($parameters['output']);
+        
+        $this->info("File size: " . number_format($fileSize) . " bytes");
+        $this->info("Estimated documents: " . number_format($lineCount));
+        
+        Log::info('Starting MongoDB-only ingestion (skip XML mode)', [
+            'ndjson_file' => $parameters['output'],
+            'file_size' => $fileSize,
+            'estimated_documents' => $lineCount,
+            'mongodb_db' => $parameters['db'],
+            'mongodb_collection' => $parameters['collection']
+        ]);
+        
+        try {
+            // MongoDB upsert
+            $this->info("Starting MongoDB upsert...");
+            $upsertedCount = $this->upsertToMongoDB(
+                $parameters['output'],
+                $parameters['mongodb'],
+                $parameters['db'],
+                $parameters['collection']
+            );
+            
+            $endTime = microtime(true);
+            $processingTime = round($endTime - $startTime, 2);
+            
+            $this->info("✓ MongoDB upsert complete: {$upsertedCount} documents");
+            $this->info("Processing time: {$processingTime} seconds");
+            
+            Log::info('MongoDB-only ingestion completed successfully', [
+                'documents_upserted' => $upsertedCount,
+                'processing_time_seconds' => $processingTime
+            ]);
+            
+            return Command::SUCCESS;
+            
+        } catch (\Exception $e) {
+            $this->line("MongoDB upsert failed: " . $e->getMessage());
+            Log::error('MongoDB-only ingestion failed', [
+                'error' => $e->getMessage()
+            ]);
+            return Command::FAILURE;
+        }
+    }
+
+    /**
+     * Count lines in NDJSON file for estimation
+     *
+     * @param string $filePath Path to NDJSON file
+     * @return int Number of lines
+     */
+    private function countNdjsonLines(string $filePath): int
+    {
+        $lineCount = 0;
+        $handle = fopen($filePath, 'r');
+        
+        if ($handle) {
+            while (($line = fgets($handle)) !== false) {
+                if (trim($line) !== '') {
+                    $lineCount++;
+                }
+            }
+            fclose($handle);
+        }
+        
+        return $lineCount;
     }
 }
